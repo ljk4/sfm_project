@@ -92,38 +92,89 @@ def check_positive_depth(R, t, pts3d):
 
 
 def run_sfm(images, all_keypoints, all_descriptors, matches_list,
-            focal_ratio=1.2, min_matches=30):
+            focal_ratio=1.2, min_matches=30, K_input=None):
     print("\n" + "=" * 60)
     print("阶段2: 增量式 SfM")
     print("=" * 60)
     n_images = len(images)
     h, w = images[0].shape[:2]
-    K = estimate_intrinsics(w, h, focal_ratio)
 
-    # 初始化 (0, 1)
-    print("\n  --- 初始化 (0, 1) ---")
-    init = initialize_from_pair(all_keypoints[0], all_keypoints[1],
-                                 matches_list[0], K)
+    # 使用外部K (来自EXIF自标定) 或启发式估计
+    if K_input is not None:
+        K = K_input.copy()
+        print(f"  [内参] 使用EXIF标定: f={K[0,0]:.1f}px")
+    else:
+        K = estimate_intrinsics(w, h, focal_ratio)
+
+    # 选择最佳初始对: 尝试不同间隔, 选E内点最多且基线适中的
+    best_init = None
+    best_score = -1
+    init_gaps = [1, 2, 3, 4, 5]  # 候选间隔
+    for gap in init_gaps:
+        if gap >= n_images: continue
+        # 交叉检查匹配初始对
+        des_a, des_b = all_descriptors[0], all_descriptors[gap]
+        if des_a is None or des_b is None: continue
+        bf = cv2.BFMatcher(cv2.NORM_L2)
+        raw_ab = bf.knnMatch(des_a, des_b, k=2)
+        raw_ba = bf.knnMatch(des_b, des_a, k=2)
+        good_ab = {}
+        for mp in raw_ab:
+            if len(mp)==2 and mp[0].distance < 0.7 * mp[1].distance:
+                good_ab[mp[0].queryIdx] = mp[0].trainIdx
+        good_ba = {}
+        for mp in raw_ba:
+            if len(mp)==2 and mp[0].distance < 0.7 * mp[1].distance:
+                good_ba[mp[0].queryIdx] = mp[0].trainIdx
+        cross = []
+        for q,t in good_ab.items():
+            if t in good_ba and good_ba[t]==q:
+                cross.append(cv2.DMatch(q, t, 0))
+        if len(cross) < 30: continue
+        # 检查E矩阵内点
+        pts1, pts2 = get_matched_points(all_keypoints[0], all_keypoints[gap], cross)
+        E_try, mask_E = cv2.findEssentialMat(pts1, pts2, K, cv2.RANSAC, 0.999, 0.5)
+        if E_try is None: continue
+        n_E = mask_E.sum()
+        # 检查基线
+        n_pts, R_try, t_try, _ = cv2.recoverPose(E_try, pts1[mask_E.ravel()==1], pts2[mask_E.ravel()==1], K)
+        baseline = np.linalg.norm(t_try)
+        if n_pts < 20 or baseline < 0.3: continue
+        # 得分: 内点×基线
+        score = n_E * baseline
+        if score > best_score:
+            best_score = score
+            best_init = (0, gap, cross)
+        print(f"    候选(0,{gap}): E内点={n_E} 基线={baseline:.2f} 得分={score:.0f}")
+
+    if best_init is None:
+        # 回退到(0,1)
+        best_init = (0, 1, matches_list[0])
+    init_i, init_j, init_matches = best_init
+    print(f"\n  --- 初始化 ({init_i}, {init_j}) 间隔={init_j-init_i}帧 ---")
+    init = initialize_from_pair(all_keypoints[init_i], all_keypoints[init_j],
+                                 init_matches, K)
     if init is None:
         return {}, {}, K, np.zeros((0,3)), np.zeros((0,3),dtype=np.uint8), [], []
 
-    Rs = {0: init['R0'], 1: init['R1']}
-    ts = {0: init['t0'], 1: init['t1']}
-    reg_indices = [0, 1]
+    Rs = {init_i: init['R0'], init_j: init['R1']}
+    ts = {init_i: init['t0'], init_j: init['t1']}
+    reg_indices = [init_i, init_j]
     points3D = init['points3D']
 
     point_maps = [{}, {}]
+    # init_matches: 在cross列表中, queryIdx→kp_init_i, trainIdx→kp_init_j
     for local_idx, match_idx in enumerate(init['valid_indices']):
-        m = matches_list[0][match_idx]
+        m = init_matches[match_idx]
         point_maps[0][m.queryIdx] = local_idx
         point_maps[1][m.trainIdx] = local_idx
 
     point_colors = []
-    img0_rgb = cv2.cvtColor(images[0], cv2.COLOR_BGR2RGB)
+    img_init_rgb = cv2.cvtColor(images[init_i], cv2.COLOR_BGR2RGB)
     for pt in init['pts1']:
         px = max(0, min(w-1, int(round(pt[0]))))
         py = max(0, min(h-1, int(round(pt[1]))))
-        point_colors.append(img0_rgb[py, px])
+        point_colors.append(img_init_rgb[py, px])
     point_colors = np.array(point_colors, dtype=np.uint8)
 
     print(f"  [初始化] 2台相机, {len(points3D)}个三维点")
@@ -181,16 +232,58 @@ def run_sfm(images, all_keypoints, all_descriptors, matches_list,
         R, _ = cv2.Rodrigues(rvec)
         t_new = tvec.reshape(3, 1)
 
-        # 位姿发散检测
+        # 位姿发散检测 + 大步长检测
         cam_center = (-R.T @ t_new).ravel()
         if len(reg_indices) >= 3:
             prev_c = (-Rs[reg_indices[-1]].T @ ts[reg_indices[-1]]).ravel()
             prev2_c = (-Rs[reg_indices[-2]].T @ ts[reg_indices[-2]]).ravel()
             expected = prev_c + (prev_c - prev2_c)
-            step = np.linalg.norm(prev_c - prev2_c) + 1e-6
+            step_ref = np.linalg.norm(prev_c - prev2_c) + 1e-6
             jump = np.linalg.norm(cam_center - expected)
-            if jump > step * 10:
+            step_current = np.linalg.norm(cam_center - prev_c)
+
+            if jump > step_ref * 10:
                 print(f"  [图{i}] 位姿发散(跳变={jump:.0f}), 跳过"); continue
+
+            # 检测异常大步长: 超过2倍历史中位步长
+            if len(reg_indices) >= 4:
+                all_steps_hist = [np.linalg.norm(
+                    (-Rs[reg_indices[k]].T @ ts[reg_indices[k]]).ravel() -
+                    (-Rs[reg_indices[k-1]].T @ ts[reg_indices[k-1]]).ravel())
+                    for k in range(1, len(reg_indices))]
+                med_step = np.median(all_steps_hist) + 1e-6
+                if step_current > med_step * 2.0:
+                    print(f"  [图{i}] 大步长({step_current:.1f}>>{med_step:.1f}), 重试更多参考帧...")
+                    # 用更多参考相机重新PnP
+                    pts2D_retry, pts3D_retry = [], []
+                    # 匹配所有前5帧已注册相机
+                    for reg_order in range(max(0, len(reg_indices)-8), len(reg_indices)):
+                        orig_k = reg_indices[reg_order]
+                        if orig_k + 1 == i and orig_k < len(matches_list):
+                            for m in matches_list[orig_k]:
+                                pt3d_idx = point_maps[reg_order].get(m.queryIdx, -1)
+                                if pt3d_idx >= 0:
+                                    pts2D_retry.append(kp_i[m.trainIdx].pt)
+                                    pts3D_retry.append(points3D[pt3d_idx])
+
+                    if len(pts2D_retry) > len(pts2D_list):
+                        # 用更多对应重新PnP
+                        pts2D_arr_r = np.float32(pts2D_retry)
+                        pts3D_arr_r = np.float32(pts3D_retry)
+                        success_r, rvec_r, tvec_r, inliers_r = cv2.solvePnPRansac(
+                            pts3D_arr_r, pts2D_arr_r, K, None,
+                            flags=cv2.SOLVEPNP_EPNP, iterationsCount=200,
+                            reprojectionError=6.0, confidence=0.999)
+                        if success_r and inliers_r is not None and len(inliers_r) > 10:
+                            R_r, _ = cv2.Rodrigues(rvec_r)
+                            t_r = tvec_r.reshape(3, 1)
+                            cam_center_r = (-R_r.T @ t_r).ravel()
+                            step_r = np.linalg.norm(cam_center_r - prev_c)
+                            if step_r < step_current * 0.8:  # 步长明显改善
+                                R, t_new = R_r, t_r
+                                cam_center = cam_center_r
+                                step_current = step_r
+                                print(f"    重注册改善: 步长{step_current:.1f}")
 
         # 三角化新点
         prev_idx = reg_indices[-1]

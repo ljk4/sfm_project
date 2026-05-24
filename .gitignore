@@ -1,4 +1,7 @@
-/.vscode
-/要求.md
-__pycache__
+__pycache__/
+output/
+*.pyc
+.claude
 说明文档.md
+要求.md
+.vscode
