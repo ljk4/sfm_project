@@ -1,6 +1,6 @@
 """
 模块5: 导出结果
-- 保存稀疏/稠密点云为 PLY 文件 (含顶点颜色)
+- 保存稀疏点云为 PLY 文件 (含顶点颜色)
 - 生成相机视锥棱线并嵌入 PLY (红色线条)
 - 保存相机参数为 NPZ 文件
 """
@@ -188,13 +188,12 @@ def save_camera_params(filepath, Rs, ts, K, reg_indices):
 
 
 def run_export(output_dir, points3D, point_colors, Rs, ts, K, reg_indices,
-               images, dense_pts=None, dense_colors=None):
+               images):
     """
     导出全部结果:
       1. 稀疏点云 + 相机视锥 → sparse_cloud.ply
-      2. 稠密点云 → dense_cloud.ply
-      3. 相机参数 → cameras.npz
-      4. 点云 + 视锥合并 → cloud_with_frustums.ply
+      2. 相机参数 → cameras.npz
+      3. 点云 + 视锥合并 → cloud_with_frustums.ply
     """
     print("\n" + "=" * 60)
     print("阶段5: 导出结果")
@@ -211,10 +210,6 @@ def run_export(output_dir, points3D, point_colors, Rs, ts, K, reg_indices,
         output_dir / 'cloud_with_frustums.ply',
         points3D, point_colors, Rs, ts, K, reg_indices, images
     )
-
-    # 稠密点云
-    if dense_pts is not None and len(dense_pts) > 0:
-        save_ply(output_dir / 'dense_cloud.ply', dense_pts, dense_colors)
 
     # 相机参数
     save_camera_params(output_dir / 'cameras.npz', Rs, ts, K, reg_indices)

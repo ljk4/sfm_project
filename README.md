@@ -98,9 +98,7 @@ main.py
 ├── visualize.py              # open3d 可视化
 ├── view_ply.py               # 独立 PLY 查看器
 ├── output/                   # 输出目录
-├── README.md                 # 本文件
-├── 说明文档.md               # 算法详细说明
-└── 要求.md                   # 原始需求
+└── README.md                   # 本文件
 ```
 
 ## 依赖
@@ -110,9 +108,3 @@ main.py
 - open3d ≥ 0.18 (可视化)
 - Pillow (EXIF 读取)
 - Matplotlib (可选)
-
-## 已知限制
-
-- 增量式 SfM 在早期帧有轻微偏差，中后期与 COLMAP 偏差 < 0.1 单位
-- BA 为 motion-only (不优化 3D 点)，全局收敛性不如 Ceres/g2o
-- 无闭环检测，长序列 (> 200 张) 可能有累积漂移
