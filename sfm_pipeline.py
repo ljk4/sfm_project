@@ -1,13 +1,14 @@
 """
 模块2: 增量式结构从运动 (Incremental Structure from Motion)
 - 固定初始对(0,1), 同一相机、恒定内参K
-- FLANN匹配 + Lowe's ratio test
+- FLANN匹配 + Lowe's ratio test + GMS 过滤
 - 增量式注册(PnP) + 位姿发散检测
 """
 
 import cv2
 import numpy as np
 import time
+from feature_matching import gms_filter
 
 
 def estimate_intrinsics(img_width, img_height, focal_ratio=1.2):
@@ -131,6 +132,12 @@ def run_sfm(images, all_keypoints, all_descriptors, matches_list,
             if t in good_ba and good_ba[t]==q:
                 cross.append(cv2.DMatch(q, t, 0))
         if len(cross) < 30: continue
+
+        # GMS 过滤交叉验证后的匹配
+        cross = gms_filter(cross, all_keypoints[0], all_keypoints[gap],
+                           (h, w), grid_size=20, min_score=3)
+        if len(cross) < 30: continue
+
         # 检查E矩阵内点
         pts1, pts2 = get_matched_points(all_keypoints[0], all_keypoints[gap], cross)
         E_try, mask_E = cv2.findEssentialMat(pts1, pts2, K, cv2.RANSAC, 0.999, 0.5)

@@ -2,12 +2,14 @@
 模块1: 特征提取与匹配
 - 使用 SIFT 提取每张图片的关键点和描述子
 - 使用 FLANN + Lowe's ratio test 在相邻图像对之间匹配
+- 使用 GMS (Grid-based Motion Statistics) 进一步过滤误匹配
 """
 
 import cv2
 import numpy as np
 from pathlib import Path
 import time
+import math
 
 
 def load_images(image_dir, max_dim=1200):
@@ -124,7 +126,87 @@ def match_sequential_pairs(all_keypoints, all_descriptors):
     return matches_list
 
 
-def run_feature_matching(image_dir, max_dim=1200):
+def gms_filter(matches, kp1, kp2, img_shape, grid_size=20, min_score=3):
+    """
+    GMS (Grid-based Motion Statistics) 网格运动统计匹配过滤
+
+    核心思想:
+      正确匹配的邻域会聚集大量匹配（运动一致性），
+      而错误匹配的邻域则匹配稀疏。
+      将图像分成网格，统计每个网格对之间的匹配数量，
+      保留匹配密集的网格对中的所有匹配。
+
+    原理:
+      1. 将图A和图B各分成 grid_size × grid_size 个网格
+      2. 对每个匹配 (p_a, p_b)，记录它落在图A的网格 (i,j) 和图B的网格 (p,q)
+      3. 统计每个网格对 [(i,j)→(p,q)] 中的匹配总数 = score
+      4. 保留 score >= min_score 的网格对中的所有匹配
+
+    参数:
+        matches:     FLANN输入的原始匹配列表 (list of cv2.DMatch)
+        kp1, kp2:    两帧的关键点列表
+        img_shape:   图像尺寸 (h, w)
+        grid_size:   网格数量 (grid_size × grid_size)
+        min_score:   分数阈值, 低于此值的网格对匹配被移除
+
+    返回:
+        filtered_matches: 过滤后的匹配 (list of cv2.DMatch)
+    """
+    if not matches:
+        return []
+
+    h, w = img_shape
+    cell_h = h / grid_size
+    cell_w = w / grid_size
+
+    # 步骤1: 为每个匹配分配网格坐标
+    # grid_pairs[(i,j,p,q)] = [match_indices]
+    grid_pairs = {}
+    for idx, m in enumerate(matches):
+        # 图A中的网格
+        x1, y1 = kp1[m.queryIdx].pt
+        gi1 = min(int(x1 / cell_w), grid_size - 1)
+        gj1 = min(int(y1 / cell_h), grid_size - 1)
+
+        # 图B中的网格
+        x2, y2 = kp2[m.trainIdx].pt
+        gi2 = min(int(x2 / cell_w), grid_size - 1)
+        gj2 = min(int(y2 / cell_h), grid_size - 1)
+
+        key = (gi1, gj1, gi2, gj2)
+        if key not in grid_pairs:
+            grid_pairs[key] = []
+        grid_pairs[key].append(idx)
+
+    # 步骤2: 对每个网格对，统计其邻域网格对的总匹配数
+    # 邻域: 图A的 (gi1±1, gj1±1) 到 图B的 (gi2±1, gj2±1)
+    # 即 3×3×3×3 = 81 个网格对
+    scores = {}
+    for (gi1, gj1, gi2, gj2), indices in grid_pairs.items():
+        score = 0
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for dpi in (-1, 0, 1):
+                    for dpj in (-1, 0, 1):
+                        ni1, nj1 = gi1 + di, gj1 + dj
+                        ni2, nj2 = gi2 + dpi, gj2 + dpj
+                        if (0 <= ni1 < grid_size and 0 <= nj1 < grid_size and
+                            0 <= ni2 < grid_size and 0 <= nj2 < grid_size):
+                            score += len(grid_pairs.get((ni1, nj1, ni2, nj2), []))
+        scores[(gi1, gj1, gi2, gj2)] = score
+
+    # 步骤3: 保留 score >= min_score 的网格对中的匹配
+    filtered_indices = set()
+    for (gi1, gj1, gi2, gj2), score in scores.items():
+        if score >= min_score:
+            filtered_indices.update(grid_pairs[(gi1, gj1, gi2, gj2)])
+
+    filtered_matches = [matches[i] for i in sorted(filtered_indices)]
+
+    return filtered_matches
+
+
+def run_feature_matching(image_dir, max_dim=1200, use_gms=True):
     """
     运行完整的特征提取与匹配流程
     返回: images, all_keypoints, all_descriptors, matches_list, scale_factors
@@ -136,5 +218,22 @@ def run_feature_matching(image_dir, max_dim=1200):
     images, img_paths, scale_factors = load_images(image_dir, max_dim)
     all_keypoints, all_descriptors = extract_features(images)
     matches_list = match_sequential_pairs(all_keypoints, all_descriptors)
+
+    # GMS 过滤: 利用运动一致性进一步剔除误匹配
+    if use_gms and images:
+        h, w = images[0].shape[:2]
+        print(f"  [GMS] 网格运动统计过滤 (网格={20}×{20}, 阈值={3})...")
+        t0 = time.time()
+        gms_total_before = sum(len(m) for m in matches_list)
+        for i in range(len(matches_list)):
+            if len(matches_list[i]) > 5:
+                matches_list[i] = gms_filter(
+                    matches_list[i], all_keypoints[i], all_keypoints[i + 1],
+                    (h, w), grid_size=20, min_score=3)
+        gms_total_after = sum(len(m) for m in matches_list)
+        t1 = time.time()
+        removed = gms_total_before - gms_total_after
+        print(f"  [GMS] 完成, 耗时 {t1-t0:.1f}s, "
+              f"移除 {removed}/{gms_total_before} 个匹配 ({removed/gms_total_before*100:.1f}%)")
 
     return images, all_keypoints, all_descriptors, matches_list, scale_factors
